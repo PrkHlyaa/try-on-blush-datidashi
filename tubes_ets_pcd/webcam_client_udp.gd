@@ -1,5 +1,20 @@
 extends Control
 
+# --- Blush Shade Data ---
+const BLUSH_SHADES = {
+	"01 Pink Fantasist": "222,99,159",
+	"02 Iredescent Pink": "228,146,168",
+	"03 Promiscious Peach": "224,135,116",
+	"04 Royal Espresso": "196,109,92",
+	"05 Brown Strada": "198,146,117",
+	"06 Carribiean Sunset": "203,118,101",
+	"07 Scarlet Sheen": "185,87,86",
+	"08 Cruise Coral": "236,143,107",
+	"09 Summer Twist": "219,129,123",
+	"10 Passion Pink": "235,148,146"
+}
+
+# --- On-Ready Variables ---
 @onready var texture_rect: TextureRect = $VideoContainer/TextureRect
 @onready var status_label: Label = $StatusLabel
 @onready var connect_button: Button = $ControlPanel/ConnectButton
@@ -8,11 +23,17 @@ extends Control
 @onready var fps_label: Label = $InfoPanel/FPSLabel
 @onready var resolution_label: Label = $InfoPanel/ResolutionLabel
 @onready var data_rate_label: Label = $InfoPanel/DataRateLabel
+@onready var shade_option_button: OptionButton = $ControlPanel/ShadeOptionButton # NEW
+@onready var intensity_slider: HSlider = $ControlPanel/IntensitySlider # NEW
+@onready var intensity_label: Label = $ControlPanel/IntensityLabel
 
+# --- Connection and State Variables ---
 var udp_client: PacketPeerUDP
+var udp_control_client: PacketPeerUDP # NEW: Dedicated control client for port 8889
 var is_connected: bool = false
 var server_host: String = "127.0.0.1"
 var server_port: int = 8888
+var control_port: int = 8889 # Control socket port
 
 # Frame reassembly
 var frame_buffers: Dictionary = {}  # seq_num -> {total_packets, received_packets, data_parts}
@@ -35,10 +56,16 @@ var frames_dropped: int = 0
 func _ready():
 	# Inisialisasi UDP client
 	udp_client = PacketPeerUDP.new()
+	udp_control_client = PacketPeerUDP.new() # Inisialisasi control client
 	
 	# Connect button signals
 	connect_button.pressed.connect(_on_connect_button_pressed)
 	quit_button.pressed.connect(_on_quit_button_pressed)
+	
+	# NEW: Connect OptionButton signal and populate shades
+	if is_instance_valid(shade_option_button):
+		shade_option_button.item_selected.connect(_on_shade_option_button_item_selected)
+		_populate_shade_options()
 	
 	# Update status
 	update_status("Ready to connect")
@@ -49,7 +76,16 @@ func _ready():
 	
 	# Debug info
 	print("🎮 Godot UDP client initialized")
-	print("Target server: ", server_host, ":", server_port)
+	print("Target server (Video): ", server_host, ":", server_port)
+	print("Target server (Control): ", server_host, ":", control_port)
+
+func _populate_shade_options():
+	"""Memasukkan semua shade blush ke OptionButton"""
+	for shade_name in BLUSH_SHADES.keys():
+		shade_option_button.add_item(shade_name)
+	
+	# Pilih shade default (Passion Pink)
+	shade_option_button.select(shade_option_button.get_item_count() - 1)
 
 func _on_quit_button_pressed():
 	get_tree().quit()
@@ -74,18 +110,16 @@ func connect_to_server():
 	print("🔄 Starting UDP connection...")
 	update_status("Connecting...")
 	
-	# Setup UDP connection
+	# 1. Setup UDP Video Connection (Logic asli tidak diubah)
 	var error = udp_client.connect_to_host(server_host, server_port)
-	
 	if error != OK:
-		update_status("Failed to setup UDP - Error: " + str(error))
-		print("❌ UDP setup failed: ", error)
+		update_status("Failed to setup UDP Video - Error: " + str(error))
+		print("❌ UDP Video setup failed: ", error)
 		return
 	
-	# Kirim registrasi ke server
+	# 2. Kirim registrasi ke server (Logic asli tidak diubah)
 	var registration_message = "REGISTER".to_utf8_buffer()
 	var send_result = udp_client.put_packet(registration_message)
-	
 	if send_result != OK:
 		update_status("Failed to register - Error: " + str(send_result))
 		print("❌ Registration failed: ", send_result)
@@ -93,7 +127,7 @@ func connect_to_server():
 	
 	print("📤 Registration sent, waiting for confirmation...")
 	
-	# Tunggu konfirmasi dari server
+	# 3. Tunggu konfirmasi dari server (Logic asli tidak diubah)
 	var timeout = 0
 	var max_timeout = 180  # 3 detik pada 60fps
 	var confirmed = false
@@ -119,11 +153,22 @@ func connect_to_server():
 		connect_button.text = "Disconnect"
 		print("🎥 Ready to receive video streams!")
 		
-		# Reset statistics
+		# Reset statistics (Logic asli tidak diubah)
 		packets_received = 0
 		frames_completed = 0
 		frames_dropped = 0
 		frame_buffers.clear()
+		
+		# 4. Setup Control UDP Connection (Perubahan minimal)
+		var control_error = udp_control_client.connect_to_host(server_host, control_port)
+		if control_error != OK:
+			print("❌ Control UDP setup failed: ", control_error)
+		else:
+			print("🎮 Control UDP client initialized on port ", control_port)
+			# 5. Kirim shade default saat koneksi berhasil
+			var default_shade_name = shade_option_button.get_item_text(shade_option_button.get_selected_id())
+			var default_rgb = BLUSH_SHADES[default_shade_name]
+			send_control_command("COLOR:" + default_rgb)
 	else:
 		update_status("Registration timeout")
 		print("❌ Registration timeout")
@@ -139,6 +184,8 @@ func disconnect_from_server():
 	
 	is_connected = false
 	udp_client.close()
+	if is_instance_valid(udp_control_client):
+		udp_control_client.close() # Close control client
 	frame_buffers.clear()
 	
 	update_status("Disconnected")
@@ -154,6 +201,32 @@ func disconnect_from_server():
 	current_fps = 0.0
 	current_data_rate = 0.0
 	update_info_display()
+
+func _on_shade_option_button_item_selected(index: int):
+	"""Handler ketika user memilih shade blush baru"""
+	if not is_connected:
+		print("⚠️ Cannot change shade, not connected to server.")
+		return
+		
+	var selected_shade_name = shade_option_button.get_item_text(index)
+	var rgb_value = BLUSH_SHADES[selected_shade_name]
+	
+	var command = "COLOR:" + rgb_value
+	send_control_command(command)
+	print("📤 Sent control command: ", command)
+	
+func send_control_command(command: String):
+	"""Mengirim command kontrol via UDP port 8889"""
+	if not is_connected:
+		return
+	
+	# PERBAIKAN: Hanya coba kirim paket, status koneksi UDP tidak perlu di cek ulang
+	# karena PacketPeerUDP tidak memiliki status seperti TCP.
+	var message = command.to_utf8_buffer()
+	var send_result = udp_control_client.put_packet(message)
+	
+	if send_result != OK:
+		print("❌ Failed to send control command: ", send_result)
 
 func receive_packets():
 	var packet_count = udp_client.get_available_packet_count()
